@@ -1,0 +1,223 @@
+=========================================================
+  LIVE FEED ATTENDANCE PIPELINE
+  Anti-Spoof AI Attendance System
+=========================================================
+
+OVERVIEW
+---------
+Instead of manually uploading a photo, the admin opens a live
+webcam feed. A class session timer runs for 55 minutes. At the
+50th minute, the system automatically captures a frame from the
+live feed and sends it to the existing ML pipeline for face
+recognition and attendance marking. Absent students are then
+automatically emailed.
+
+---------------------------------------------------------
+PIPELINE FLOW
+---------------------------------------------------------
+
+[STEP 1] Admin Starts Live Session
+    - Admin clicks "Start Live Session" button in the dashboard
+    - Admin fills in:
+        * Date (auto-filled to today)
+        * Class/Subject name
+        * Session duration (default: 55 minutes)
+        * Auto-capture at minute (default: 50)
+    - Frontend requests access to webcam via browser API (getUserMedia)
+    - Live video stream appears on screen
+
+[STEP 2] Webcam Feed Streams in Browser
+    - Browser captures webcam using:
+        navigator.mediaDevices.getUserMedia({ video: true })
+    - Video element displays live feed on the admin's screen
+    - No data is sent to server yet (pure local browser stream)
+
+[STEP 3] Session Timer Starts
+    - A countdown timer starts immediately after webcam opens
+    - UI shows:
+        * Elapsed time  (e.g., "00:23:15 elapsed")
+        * Time to auto-capture (e.g., "Auto-capture in 26:45")
+        * A progress bar filling toward the 50-minute mark
+
+[STEP 4] Auto-Capture at Minute 50
+    - When elapsed time reaches the configured minute (50th min):
+        * JS draws the current video frame onto an HTML <canvas>
+        * Canvas is converted to a JPEG image Blob
+        * Blob is sent as multipart/form-data to:
+              POST /api/attendance/mark
+          (same endpoint used by manual photo upload)
+        * A "Capturing..." indicator flashes on screen
+
+    CAPTURE LOGIC (JavaScript):
+        canvas.width  = video.videoWidth
+        canvas.height = video.videoHeight
+        ctx.drawImage(video, 0, 0)
+        canvas.toBlob(blob => {
+            // send to /api/attendance/mark
+        }, 'image/jpeg', 0.92)
+
+[STEP 5] Backend Processes the Frame
+    - app.py receives the captured frame (same as manual upload)
+    - Existing pipeline runs:
+        a) YOLOv8    → detects all faces in the frame
+        b) RetinaFace → aligns each detected face
+        c) AdaFace   → generates 512-dim embedding per face
+        d) Cosine similarity → matches embeddings to enrolled students
+        e) Threshold (0.4) → marks as present / absent
+    - Attendance record saved to Firestore
+
+[STEP 6] Email Absent Students
+    - Backend calls notify_absent_students_async()
+    - Runs in background thread (no delay to response)
+    - Each absent student receives an email with:
+        * Their name
+        * Subject / class name
+        * Date of absence
+
+[STEP 7] Results Displayed
+    - Frontend receives JSON response from backend
+    - Shows a results panel:
+        * Total faces detected
+        * Present students (green) with confidence scores
+        * Absent students (red)
+    - Admin can optionally retrigger a manual capture anytime
+
+[STEP 8] Session Ends
+    - After full 55 minutes, session auto-ends
+    - Webcam stream is stopped (camera light turns off)
+    - Admin sees full attendance summary
+
+---------------------------------------------------------
+COMPONENT BREAKDOWN
+---------------------------------------------------------
+
+FRONTEND  (web/frontend/index.html + app.js)
+--------------------------------------------
+New UI section: "Live Attendance" tab under Admin Dashboard
+
+  Elements:
+    - <video id="liveVideo">        : shows webcam stream
+    - <canvas id="captureCanvas">   : hidden, used for frame grab
+    - #sessionTimer                 : elapsed time display
+    - #captureCountdown             : countdown to auto-capture
+    - #progressBar                  : visual fill toward minute 50
+    - "Start Session" button        : begins timer + webcam
+    - "Capture Now" button          : manual override capture
+    - "Stop Session" button         : ends session, stops webcam
+    - #resultsPanel                 : shows attendance results after capture
+
+  JS Flow:
+    startSession()
+      → getUserMedia()
+      → setInterval(updateTimer, 1000)
+      → when elapsed == captureMinute → captureAndSend()
+
+    captureAndSend()
+      → canvas.drawImage(video)
+      → canvas.toBlob()
+      → FormData (date, blob as 'photo')
+      → fetch('/api/attendance/mark', { method:'POST', body:formData })
+      → displayResults(response)
+
+BACKEND  (web/backend/app.py)
+------------------------------
+  No new route needed.
+  Existing POST /api/attendance/mark handles the captured frame.
+  Only addition: email service already integrated (Step 6).
+
+EMAIL SERVICE  (scripts/email_service.py)
+-----------------------------------------
+  Already implemented. Triggered automatically post-capture.
+
+---------------------------------------------------------
+DATA FLOW DIAGRAM
+---------------------------------------------------------
+
+  ADMIN BROWSER                          FLASK BACKEND
+  ─────────────                          ─────────────
+  Open Live Tab
+      │
+  getUserMedia() ──── webcam stream ──► <video> element
+      │
+  Start Timer (55 min)
+      │
+      │  [at minute 50]
+      │
+  canvas.drawImage(video)
+  canvas.toBlob() ──── JPEG frame ─────► POST /api/attendance/mark
+                                              │
+                                         YOLOv8 (detect faces)
+                                              │
+                                         RetinaFace (align)
+                                              │
+                                         AdaFace (embed)
+                                              │
+                                         Cosine Similarity
+                                              │
+                                         Save to Firestore
+                                              │
+                                         Email absent students (async)
+                                              │
+  Display Results ◄──── JSON response ─────────┘
+
+---------------------------------------------------------
+IMPLEMENTATION PLAN (what to build)
+---------------------------------------------------------
+
+Phase 1 — Frontend Live Tab          [HTML + JS changes in app.js]
+    ✦ Add "Live" tab to admin dashboard navbar
+    ✦ Add video element + hidden canvas
+    ✦ Implement startSession(), stopSession(), captureAndSend()
+    ✦ Timer logic with configurable capture minute
+    ✦ Progress bar + countdown UI
+
+Phase 2 — Backend (no major change)  [app.py minor tweak]
+    ✦ Accept 'subject' field in /api/attendance/mark form data
+      (pass to email service as class name)
+
+Phase 3 — Polish
+    ✦ Anti-spoofing check on captured frame before recognition
+    ✦ Allow multiple captures during session (averaged results)
+    ✦ Show live face detection overlay on video (bounding boxes)
+
+---------------------------------------------------------
+KEY DESIGN DECISIONS
+---------------------------------------------------------
+
+Q: Why capture at minute 50 and not at the start?
+A: Students may arrive late. By minute 50, attendance is stable.
+   Early leavers are also caught since they must still be present
+   at the 50-minute mark to be marked present.
+
+Q: Why browser-side capture instead of server-side OpenCV stream?
+A: Browser getUserMedia() works with any webcam without extra
+   drivers or OpenCV VideoCapture device wiring. The server
+   doesn't need to know the camera device index. More portable.
+
+Q: What if the auto-capture fails (no faces detected)?
+A: Admin gets an error in the results panel and can click
+   "Capture Now" to manually retrigger a fresh capture.
+
+Q: What if a student joins late and misses the auto-capture?
+A: Admin can hit "Capture Now" button at any time to run
+   an additional attendance pass. Results are merged (union of
+   present students across all captures in the session).
+
+---------------------------------------------------------
+FILES TO MODIFY / CREATE
+---------------------------------------------------------
+
+  MODIFY:
+    main_project/web/frontend/index.html   → add Live tab HTML
+    main_project/web/frontend/app.js       → add live session JS logic
+    main_project/web/backend/app.py        → minor: accept 'subject' form field
+
+  NO CHANGE NEEDED:
+    scripts/email_service.py               → already works
+    firebase/firebase_service.py           → already works
+    scripts/utils.py                       → already works
+    All ML model loading code              → already works
+
+=========================================================
+END OF PIPELINE
+=========================================================
